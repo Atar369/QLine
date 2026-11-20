@@ -1,0 +1,29 @@
+{
+  "project_info": {
+    "project_number": "463550959111",
+    "project_id": "qline-a1937",
+    "storage_bucket": "qline-a1937.firebasestorage.app"
+  },
+  "client": [
+    {
+      "client_info": {
+        "mobilesdk_app_id": "1:463550959111:android:f6602e4b572dbf03e424a2",
+        "android_client_info": {
+          "package_name": "hk.hkucs.qline"
+        }
+      },
+      "oauth_client": [],
+      "api_key": [
+        {
+          "current_key": "AIzaSyDgzxjVUnARyJJJQjcB2oiqX0SMPZDLbck"
+        }
+      ],
+      "services": {
+        "appinvite_service": {
+          "other_platform_oauth_client": []
+        }
+      }
+    }
+  ],
+  "configuration_version": "1"
+}
