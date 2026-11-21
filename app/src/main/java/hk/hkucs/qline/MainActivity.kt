@@ -35,7 +35,6 @@ import androidx.compose.material3.PrimaryTabRow
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
-import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateListOf
 import androidx.compose.runtime.mutableStateOf
@@ -53,12 +52,12 @@ import com.google.firebase.auth.FirebaseAuth
 import com.google.firebase.firestore.FirebaseFirestore
 import hk.hkucs.qline.ui.theme.QLineTheme
 
-private data class Clinic(val id: String, val name: String, val specialty: String)
+private data class Restaurant(val id: String, val name: String, val cuisine: String)
 
-private val clinics = listOf(
-    Clinic("clinicA", "Harbour Clinic", "Family medicine"),
-    Clinic("clinicB", "Central Clinic", "Diagnostics"),
-    Clinic("clinicC", "Garden Clinic", "Wellness")
+private val restaurants = listOf(
+    Restaurant("harbour-grill", "Harbour Grill", "Cantonese barbecue"),
+    Restaurant("central-noodles", "Central Noodles", "Noodles and dumplings"),
+    Restaurant("garden-table", "Garden Table", "Modern cafe")
 )
 
 private val db: FirebaseFirestore get() = FirebaseFirestore.getInstance()
@@ -85,10 +84,6 @@ private fun QLineApp() {
         onDispose { auth.removeAuthStateListener(listener) }
     }
 
-    LaunchedEffect(user?.uid) {
-        if (user != null) clinics.forEach(::seedQueue)
-    }
-
     Surface(Modifier.fillMaxSize(), color = MaterialTheme.colorScheme.background) {
         if (user == null) SignInScreen(auth) else QueueHome(user!!.email, auth)
     }
@@ -109,9 +104,9 @@ private fun SignInScreen(auth: FirebaseAuth) {
     ) {
         BrandMark()
         Spacer(Modifier.height(28.dp))
-        Text("Skip the waiting room.", style = MaterialTheme.typography.headlineMedium, fontWeight = FontWeight.Bold)
+        Text("Your table, without the wait.", style = MaterialTheme.typography.headlineMedium, fontWeight = FontWeight.Bold)
         Spacer(Modifier.height(8.dp))
-        Text("Join your clinic’s live queue and know when it’s your turn.", color = Muted)
+        Text("Join a restaurant queue and know when your table is ready.", color = Muted)
         Spacer(Modifier.height(28.dp))
         OutlinedTextField(
             value = email, onValueChange = { email = it; error = null },
@@ -180,8 +175,8 @@ private fun SignInScreen(auth: FirebaseAuth) {
 @Composable
 private fun QueueHome(email: String?, auth: FirebaseAuth) {
     var selectedTab by remember { mutableStateOf(0) }
-    var clinicId by remember { mutableStateOf(clinics.first().id) }
-    val clinic = clinics.first { it.id == clinicId }
+    var restaurantId by remember { mutableStateOf(restaurants.first().id) }
+    val restaurant = restaurants.first { it.id == restaurantId }
 
     Scaffold(
         containerColor = MaterialTheme.colorScheme.background,
@@ -218,40 +213,40 @@ private fun QueueHome(email: String?, auth: FirebaseAuth) {
                 .padding(horizontal = 20.dp, vertical = 16.dp),
             verticalArrangement = Arrangement.spacedBy(18.dp)
         ) {
-            Text(if (selectedTab == 0) "Choose a clinic" else "Clinic desk", style = MaterialTheme.typography.titleLarge, fontWeight = FontWeight.Bold)
+            Text(if (selectedTab == 0) "Choose a restaurant" else "Restaurant desk", style = MaterialTheme.typography.titleLarge, fontWeight = FontWeight.Bold)
             Row(
                 modifier = Modifier.fillMaxWidth().horizontalScroll(rememberScrollState()),
                 horizontalArrangement = Arrangement.spacedBy(8.dp)
             ) {
-                clinics.forEach { option ->
+                restaurants.forEach { option ->
                     FilterChip(
-                        selected = clinicId == option.id,
-                        onClick = { clinicId = option.id },
-                        label = { Text(option.name.removeSuffix(" Clinic")) }
+                        selected = restaurantId == option.id,
+                        onClick = { restaurantId = option.id },
+                        label = { Text(option.name) }
                     )
                 }
             }
-            if (selectedTab == 0) CustomerPanel(clinic)
-            else StaffPanel(clinic)
+            if (selectedTab == 0) CustomerPanel(restaurant)
+            else StaffPanel(restaurant)
             Text("Live updates • Queue data syncs across devices", Modifier.align(Alignment.CenterHorizontally), color = Muted, style = MaterialTheme.typography.labelSmall)
         }
     }
 }
 
 @Composable
-private fun CustomerPanel(clinic: Clinic) {
-    var queue by remember(clinic.id) { mutableStateOf<Queue?>(null) }
-    val tickets = remember(clinic.id) { mutableStateListOf<Ticket>() }
-    var status by remember(clinic.id) { mutableStateOf<String?>(null) }
-    var busy by remember(clinic.id) { mutableStateOf(false) }
+private fun CustomerPanel(restaurant: Restaurant) {
+    var queue by remember(restaurant.id) { mutableStateOf<Queue?>(null) }
+    val tickets = remember(restaurant.id) { mutableStateListOf<Ticket>() }
+    var status by remember(restaurant.id) { mutableStateOf<String?>(null) }
+    var busy by remember(restaurant.id) { mutableStateOf(false) }
     val user = FirebaseAuth.getInstance().currentUser
     val uid = user?.uid ?: return
 
-    DisposableEffect(clinic.id) {
-        val queueReg = db.collection("queues").document(clinic.id).addSnapshotListener { snap, _ ->
+    DisposableEffect(restaurant.id) {
+        val queueReg = db.collection("queues").document(restaurant.id).addSnapshotListener { snap, _ ->
             queue = snap?.toObject(Queue::class.java)
         }
-        val ticketsReg = db.collection("tickets").whereEqualTo("queueId", clinic.id)
+        val ticketsReg = db.collection("tickets").whereEqualTo("queueId", restaurant.id)
             .addSnapshotListener { snap, _ ->
                 tickets.clear()
                 snap?.documents?.mapNotNullTo(tickets) { it.toObject(Ticket::class.java) }
@@ -264,6 +259,7 @@ private fun CustomerPanel(clinic: Clinic) {
         tickets.count { it.status == Ticket.WAITING && it.number in (current + 1) until ticket.number }
     } ?: 0
     val eta = ahead * (queue?.minutesPerPerson ?: 5)
+    val isOpen = queue?.isOpen ?: true
 
     Column(verticalArrangement = Arrangement.spacedBy(16.dp)) {
         Card(
@@ -271,9 +267,9 @@ private fun CustomerPanel(clinic: Clinic) {
             shape = RoundedCornerShape(24.dp)
         ) {
             Column(Modifier.fillMaxWidth().padding(22.dp)) {
-                Text(clinic.name, color = Color.White, style = MaterialTheme.typography.titleLarge, fontWeight = FontWeight.Bold)
+                Text(restaurant.name, color = Color.White, style = MaterialTheme.typography.titleLarge, fontWeight = FontWeight.Bold)
                 Spacer(Modifier.height(4.dp))
-                Text(clinic.specialty, color = Color(0xFFB7C7D8))
+                Text(restaurant.cuisine, color = Color(0xFFB7C7D8))
                 Spacer(Modifier.height(22.dp))
                 Text("NOW SERVING", color = Color(0xFFB7C7D8), style = MaterialTheme.typography.labelMedium)
                 Spacer(Modifier.height(3.dp))
@@ -302,7 +298,7 @@ private fun CustomerPanel(clinic: Clinic) {
                     Button(
                         onClick = {
                             busy = true; status = null
-                            cancelTicket(clinic, uid) { message -> busy = false; status = message }
+                            cancelTicket(restaurant, uid) { message -> busy = false; status = message }
                         },
                         enabled = !busy && mine.status == Ticket.WAITING,
                         colors = ButtonDefaults.buttonColors(containerColor = Color.White, contentColor = Ink)
@@ -310,45 +306,49 @@ private fun CustomerPanel(clinic: Clinic) {
                 }
             }
         } else {
-            Text("Take a ticket to save your place. We’ll keep your estimate up to date.", color = Muted)
+            Text(
+                if (isOpen) "Join the queue to save your place. We’ll keep your estimate up to date."
+                else "This restaurant has paused its queue for now.",
+                color = Muted
+            )
             Button(
                 onClick = {
                     busy = true; status = null
-                    takeTicket(clinic, uid) { result, message ->
+                    takeTicket(restaurant, uid) { result, message ->
                         busy = false
                         status = message ?: if (result?.alreadyActive == true) "You already have an active ticket here." else "Your ticket is ready."
                     }
                 },
-                enabled = !busy,
+                enabled = !busy && isOpen,
                 modifier = Modifier.fillMaxWidth().height(54.dp),
                 shape = RoundedCornerShape(16.dp)
             ) {
                 if (busy) CircularProgressIndicator(Modifier.size(20.dp), color = Color.White, strokeWidth = 2.dp)
-                else Text("Take a ticket", fontWeight = FontWeight.SemiBold)
+                else Text(if (isOpen) "Join the queue" else "Queue paused", fontWeight = FontWeight.SemiBold)
             }
         }
         if (status != null) Text(status!!, color = if (status!!.startsWith("Could")) MaterialTheme.colorScheme.error else Color(0xFF32755C))
         Card(colors = CardDefaults.cardColors(containerColor = Color.White), shape = RoundedCornerShape(20.dp)) {
             Column(Modifier.fillMaxWidth().padding(18.dp)) {
-                Text("A smoother visit", fontWeight = FontWeight.SemiBold)
+                Text("Enjoy your time nearby", fontWeight = FontWeight.SemiBold)
                 Spacer(Modifier.height(5.dp))
-                Text("You can wait anywhere nearby. Keep QLine open to see your live position.", color = Muted)
+                Text("Wait anywhere nearby and keep QLine open to see your live position.", color = Muted)
             }
         }
     }
 }
 
 @Composable
-private fun StaffPanel(clinic: Clinic) {
-    var queue by remember(clinic.id) { mutableStateOf<Queue?>(null) }
-    val tickets = remember(clinic.id) { mutableStateListOf<Ticket>() }
-    var message by remember(clinic.id) { mutableStateOf<String?>(null) }
-    var busy by remember(clinic.id) { mutableStateOf(false) }
-    DisposableEffect(clinic.id) {
-        val queueReg = db.collection("queues").document(clinic.id).addSnapshotListener { snap, _ ->
+private fun StaffPanel(restaurant: Restaurant) {
+    var queue by remember(restaurant.id) { mutableStateOf<Queue?>(null) }
+    val tickets = remember(restaurant.id) { mutableStateListOf<Ticket>() }
+    var message by remember(restaurant.id) { mutableStateOf<String?>(null) }
+    var busy by remember(restaurant.id) { mutableStateOf(false) }
+    DisposableEffect(restaurant.id) {
+        val queueReg = db.collection("queues").document(restaurant.id).addSnapshotListener { snap, _ ->
             queue = snap?.toObject(Queue::class.java)
         }
-        val ticketsReg = db.collection("tickets").whereEqualTo("queueId", clinic.id)
+        val ticketsReg = db.collection("tickets").whereEqualTo("queueId", restaurant.id)
             .addSnapshotListener { snap, _ ->
                 tickets.clear()
                 snap?.documents?.mapNotNullTo(tickets) { it.toObject(Ticket::class.java) }
@@ -359,11 +359,14 @@ private fun StaffPanel(clinic: Clinic) {
     val serving = tickets.firstOrNull { it.status == Ticket.CALLED }
     val next = tickets.filter { it.status == Ticket.WAITING && it.number > current }.minByOrNull { it.number }
     val waitingCount = tickets.count { it.status == Ticket.WAITING }
+    val isOpen = queue?.isOpen ?: true
 
     Column(verticalArrangement = Arrangement.spacedBy(16.dp)) {
         Card(colors = CardDefaults.cardColors(containerColor = Color.White), shape = RoundedCornerShape(24.dp)) {
             Column(Modifier.fillMaxWidth().padding(22.dp)) {
-                Text(clinic.name, color = Muted, style = MaterialTheme.typography.labelLarge)
+                Text(restaurant.name, color = Muted, style = MaterialTheme.typography.labelLarge)
+                Spacer(Modifier.height(12.dp))
+                Text(if (isOpen) "Accepting guests" else "Queue paused", color = if (isOpen) Teal else Muted, fontWeight = FontWeight.SemiBold)
                 Spacer(Modifier.height(12.dp))
                 Text("Current ticket", color = Muted)
                 Text(serving?.let { numberLabel(it.number) } ?: "—", style = MaterialTheme.typography.displaySmall, fontWeight = FontWeight.Bold, color = Ink)
@@ -380,7 +383,7 @@ private fun StaffPanel(clinic: Clinic) {
         Button(
             onClick = {
                 busy = true; message = null
-                callNext(clinic) { called, error ->
+                callNext(restaurant) { called, error ->
                     busy = false
                     message = error ?: if (called) "Next ticket called." else "The queue is clear."
                 }
@@ -392,15 +395,27 @@ private fun StaffPanel(clinic: Clinic) {
         OutlinedButton(
             onClick = {
                 busy = true; message = null
-                resetQueue(clinic) { error ->
+                setQueueOpen(restaurant, !isOpen) { error ->
                     busy = false
-                    message = error ?: "Demo queue reset."
+                    message = error ?: if (isOpen) "Queue paused." else "Queue is open."
                 }
             },
             enabled = !busy,
             modifier = Modifier.fillMaxWidth().height(50.dp),
             shape = RoundedCornerShape(16.dp)
-        ) { Text("Reset demo queue") }
+        ) { Text(if (isOpen) "Pause queue" else "Open queue") }
+        OutlinedButton(
+            onClick = {
+                busy = true; message = null
+                resetQueue(restaurant) { error ->
+                    busy = false
+                    message = error ?: "Queue reset."
+                }
+            },
+            enabled = !busy,
+            modifier = Modifier.fillMaxWidth().height(50.dp),
+            shape = RoundedCornerShape(16.dp)
+        ) { Text("Reset queue") }
         if (message != null) Text(message!!, color = Muted)
         Text("Staff tools are open for presentation and demo use.", color = Muted, style = MaterialTheme.typography.bodySmall)
     }
@@ -436,18 +451,9 @@ private data class TakeTicketResult(val number: Long, val alreadyActive: Boolean
 
 private val ACTIVE_STATUSES = setOf(Ticket.WAITING, Ticket.CALLED)
 
-private fun seedQueue(clinic: Clinic) {
-    val reference = db.collection("queues").document(clinic.id)
-    db.runTransaction { transaction ->
-        val snapshot = transaction.get(reference)
-        if (!snapshot.exists()) transaction.set(reference, Queue.seed(clinic.name).toMap())
-        null
-    }
-}
-
-private fun takeTicket(clinic: Clinic, uid: String, callback: (TakeTicketResult?, String?) -> Unit) {
-    val queueRef = db.collection("queues").document(clinic.id)
-    val ticketRef = db.collection("tickets").document("${clinic.id}_$uid")
+private fun takeTicket(restaurant: Restaurant, uid: String, callback: (TakeTicketResult?, String?) -> Unit) {
+    val queueRef = db.collection("queues").document(restaurant.id)
+    val ticketRef = db.collection("tickets").document("${restaurant.id}_$uid")
     db.runTransaction { transaction ->
         val queueSnapshot = transaction.get(queueRef)
         val ticketSnapshot = transaction.get(ticketRef)
@@ -455,24 +461,25 @@ private fun takeTicket(clinic: Clinic, uid: String, callback: (TakeTicketResult?
         if (existing != null && existing.status in ACTIVE_STATUSES) {
             return@runTransaction TakeTicketResult(existing.number, true)
         }
-        val queue = queueSnapshot.toObject(Queue::class.java) ?: Queue.seed(clinic.name)
+        val queue = queueSnapshot.toObject(Queue::class.java) ?: Queue.seed(restaurant.name)
+        if (!queue.isOpen) throw IllegalStateException("This restaurant has paused its queue.")
         val number = queue.nextTicketNumber
         if (queueSnapshot.exists()) {
             transaction.update(queueRef, "nextTicketNumber", number + 1)
         } else {
             transaction.set(
                 queueRef,
-                Queue.seed(clinic.name).copy(nextTicketNumber = number + 1).toMap()
+                Queue.seed(restaurant.name).copy(nextTicketNumber = number + 1).toMap()
             )
         }
-        transaction.set(ticketRef, Ticket(clinic.id, number, uid, Ticket.WAITING).toMap())
+        transaction.set(ticketRef, Ticket(restaurant.id, number, uid, Ticket.WAITING).toMap())
         TakeTicketResult(number, false)
     }.addOnSuccessListener { callback(it, null) }
         .addOnFailureListener { callback(null, "Could not take a ticket: ${it.localizedMessage ?: "try again."}") }
 }
 
-private fun cancelTicket(clinic: Clinic, uid: String, callback: (String) -> Unit) {
-    val ticketRef = db.collection("tickets").document("${clinic.id}_$uid")
+private fun cancelTicket(restaurant: Restaurant, uid: String, callback: (String) -> Unit) {
+    val ticketRef = db.collection("tickets").document("${restaurant.id}_$uid")
     db.runTransaction { transaction ->
         val snapshot = transaction.get(ticketRef)
         val ticket = snapshot.toObject(Ticket::class.java)
@@ -482,9 +489,9 @@ private fun cancelTicket(clinic: Clinic, uid: String, callback: (String) -> Unit
         .addOnFailureListener { callback("Could not cancel: ${it.localizedMessage ?: "try again."}") }
 }
 
-private fun callNext(clinic: Clinic, callback: (Boolean, String?) -> Unit) {
-    val queueRef = db.collection("queues").document(clinic.id)
-    val ticketQuery = db.collection("tickets").whereEqualTo("queueId", clinic.id)
+private fun callNext(restaurant: Restaurant, callback: (Boolean, String?) -> Unit) {
+    val queueRef = db.collection("queues").document(restaurant.id)
+    val ticketQuery = db.collection("tickets").whereEqualTo("queueId", restaurant.id)
     ticketQuery.get().addOnSuccessListener { snapshot ->
         val tickets = snapshot.documents.mapNotNull { it.toObject(Ticket::class.java) }
         val called = tickets.firstOrNull { it.status == Ticket.CALLED }
@@ -495,7 +502,7 @@ private fun callNext(clinic: Clinic, callback: (Boolean, String?) -> Unit) {
             val queueSnapshot = transaction.get(queueRef)
             val nextSnapshot = nextRef?.let(transaction::get)
             val calledSnapshot = calledRef?.let(transaction::get)
-            val queue = queueSnapshot.toObject(Queue::class.java) ?: Queue.seed(clinic.name)
+            val queue = queueSnapshot.toObject(Queue::class.java) ?: Queue.seed(restaurant.name)
             val nextStillWaiting = nextSnapshot?.toObject(Ticket::class.java)?.let {
                 it.status == Ticket.WAITING && it.number > queue.currentTicketNumber
             } ?: false
@@ -507,7 +514,7 @@ private fun callNext(clinic: Clinic, callback: (Boolean, String?) -> Unit) {
             if (!queueSnapshot.exists()) {
                 transaction.set(
                     queueRef,
-                    Queue.seed(clinic.name).copy(
+                    Queue.seed(restaurant.name).copy(
                         currentTicketNumber = if (nextStillWaiting) next.number else queue.currentTicketNumber,
                         nextTicketNumber = if (nextStillWaiting) maxOf(queue.nextTicketNumber, next.number + 1) else queue.nextTicketNumber
                     ).toMap()
@@ -521,9 +528,9 @@ private fun callNext(clinic: Clinic, callback: (Boolean, String?) -> Unit) {
     }.addOnFailureListener { callback(false, "Could not load queue: ${it.localizedMessage ?: "try again."}") }
 }
 
-private fun resetQueue(clinic: Clinic, callback: (String?) -> Unit) {
-    val queueRef = db.collection("queues").document(clinic.id)
-    val ticketQuery = db.collection("tickets").whereEqualTo("queueId", clinic.id)
+private fun resetQueue(restaurant: Restaurant, callback: (String?) -> Unit) {
+    val queueRef = db.collection("queues").document(restaurant.id)
+    val ticketQuery = db.collection("tickets").whereEqualTo("queueId", restaurant.id)
     ticketQuery.get().addOnSuccessListener { snapshot ->
         if (snapshot.size() > 499) {
             callback("Could not reset queue: too many tickets to reset in one operation.")
@@ -531,10 +538,24 @@ private fun resetQueue(clinic: Clinic, callback: (String?) -> Unit) {
         }
         val batch = db.batch()
         snapshot.documents.forEach { batch.update(it.reference, "status", Ticket.CANCELLED) }
-        batch.set(queueRef, Queue.seed(clinic.name).toMap())
+        batch.set(queueRef, Queue.seed(restaurant.name).toMap())
         batch.commit().addOnSuccessListener { callback(null) }
             .addOnFailureListener { callback("Could not reset queue: ${it.localizedMessage ?: "try again."}") }
     }.addOnFailureListener { callback("Could not load queue: ${it.localizedMessage ?: "try again."}") }
+}
+
+private fun setQueueOpen(restaurant: Restaurant, isOpen: Boolean, callback: (String?) -> Unit) {
+    val queueRef = db.collection("queues").document(restaurant.id)
+    db.runTransaction { transaction ->
+        val snapshot = transaction.get(queueRef)
+        if (snapshot.exists()) {
+            transaction.update(queueRef, "isOpen", isOpen)
+        } else {
+            transaction.set(queueRef, Queue.seed(restaurant.name).copy(isOpen = isOpen).toMap())
+        }
+        null
+    }.addOnSuccessListener { callback(null) }
+        .addOnFailureListener { callback("Could not update queue: ${it.localizedMessage ?: "try again."}") }
 }
 
 private fun numberLabel(number: Long) = if (number == 0L) "—" else number.toString().padStart(3, '0')

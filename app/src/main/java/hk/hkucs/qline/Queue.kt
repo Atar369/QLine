@@ -4,13 +4,15 @@ data class Queue(
     val name: String = "",
     val currentTicketNumber: Long = 0,
     val nextTicketNumber: Long = 1,
-    val minutesPerPerson: Long = 5
+    val minutesPerPerson: Long = 5,
+    val isOpen: Boolean = true
 ) {
     fun toMap() = mapOf(
         "name" to name,
         "currentTicketNumber" to currentTicketNumber,
         "nextTicketNumber" to nextTicketNumber,
-        "minutesPerPerson" to minutesPerPerson
+        "minutesPerPerson" to minutesPerPerson,
+        "isOpen" to isOpen
     )
 
     companion object {
