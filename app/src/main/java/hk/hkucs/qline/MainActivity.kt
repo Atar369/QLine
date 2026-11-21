@@ -1,6 +1,7 @@
 package hk.hkucs.qline
 
 import android.os.Bundle
+import android.content.pm.PackageManager
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
@@ -16,27 +17,24 @@ import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.RoundedCornerShape
-import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material3.Button
 import androidx.compose.material3.ButtonDefaults
 import androidx.compose.material3.Card
 import androidx.compose.material3.CardDefaults
 import androidx.compose.material3.CircularProgressIndicator
-import androidx.compose.material3.FilterChip
 import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Scaffold
 import androidx.compose.material3.Surface
-import androidx.compose.material3.Tab
-import androidx.compose.material3.PrimaryTabRow
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateListOf
+import androidx.compose.runtime.mutableStateMapOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
@@ -44,27 +42,24 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.text.font.FontWeight
-import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.text.input.PasswordVisualTransformation
 import androidx.compose.ui.unit.dp
 import com.google.firebase.auth.FirebaseAuth
 import com.google.firebase.firestore.FirebaseFirestore
+import com.google.android.libraries.places.api.Places
 import hk.hkucs.qline.ui.theme.QLineTheme
-
-private data class Restaurant(val id: String, val name: String, val cuisine: String)
-
-private val restaurants = listOf(
-    Restaurant("harbour-grill", "Harbour Grill", "Cantonese barbecue"),
-    Restaurant("central-noodles", "Central Noodles", "Noodles and dumplings"),
-    Restaurant("garden-table", "Garden Table", "Modern cafe")
-)
 
 private val db: FirebaseFirestore get() = FirebaseFirestore.getInstance()
 
 class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        val metadata = packageManager.getApplicationInfo(packageName, PackageManager.GET_META_DATA).metaData
+        val mapsApiKey = metadata?.getString("com.google.android.geo.API_KEY").orEmpty()
+        if (mapsApiKey.isNotBlank() && !Places.isInitialized()) {
+            Places.initializeWithNewPlacesApiEnabled(applicationContext, mapsApiKey)
+        }
         enableEdgeToEdge()
         setContent {
             QLineTheme(dynamicColor = false) {
@@ -85,7 +80,7 @@ private fun QLineApp() {
     }
 
     Surface(Modifier.fillMaxSize(), color = MaterialTheme.colorScheme.background) {
-        if (user == null) SignInScreen(auth) else QueueHome(user!!.email, auth)
+        if (user == null) SignInScreen(auth) else QueueHome(user!!.email, user!!.uid, auth)
     }
 }
 
@@ -173,37 +168,88 @@ private fun SignInScreen(auth: FirebaseAuth) {
 }
 
 @Composable
-private fun QueueHome(email: String?, auth: FirebaseAuth) {
-    var selectedTab by remember { mutableStateOf(0) }
-    var restaurantId by remember { mutableStateOf(restaurants.first().id) }
-    val restaurant = restaurants.first { it.id == restaurantId }
+private fun QueueHome(email: String?, uid: String, auth: FirebaseAuth) {
+    var membership by remember(uid) { mutableStateOf<StaffMembership?>(null) }
+    var membershipLoaded by remember(uid) { mutableStateOf(false) }
+    var membershipError by remember(uid) { mutableStateOf<String?>(null) }
+    val partners = remember { mutableStateMapOf<String, PartnerRestaurant>() }
+    var partnerError by remember { mutableStateOf<String?>(null) }
+    val staffRestaurants = remember(uid) { mutableStateMapOf<String, Restaurant>() }
+    var selectedRestaurantId by remember(uid) { mutableStateOf<String?>(null) }
+    var selectedCustomerRestaurant by remember(uid) { mutableStateOf<Restaurant?>(null) }
+
+    DisposableEffect(uid) {
+        val registration = db.collection("staffMemberships").document(uid)
+            .addSnapshotListener { snapshot, exception ->
+                if (exception != null) {
+                    membershipError = "Could not verify staff access: ${exception.localizedMessage ?: "try again."}"
+                } else {
+                    membershipError = null
+                    membership = snapshot?.takeIf { it.exists() }?.toObject(StaffMembership::class.java)
+                    membershipLoaded = true
+                }
+            }
+        onDispose { registration.remove() }
+    }
+    DisposableEffect(Unit) {
+        val registration = db.collection("partnerRestaurants")
+            .whereEqualTo("active", true)
+            .addSnapshotListener { snapshot, exception ->
+                if (exception != null) {
+                    partnerError = "Could not load partner restaurants: ${exception.localizedMessage ?: "try again."}"
+                } else {
+                    partnerError = null
+                    partners.clear()
+                    snapshot?.documents?.forEach { document ->
+                        document.toObject(PartnerRestaurant::class.java)?.let { partners[document.id] = it }
+                    }
+                }
+            }
+        onDispose { registration.remove() }
+    }
+    DisposableEffect(membership) {
+        staffRestaurants.clear()
+        val registrations = membership?.restaurantIds.orEmpty().distinct().map { restaurantId ->
+            db.collection("partnerRestaurants").document(restaurantId).addSnapshotListener { snapshot, exception ->
+                if (exception != null) {
+                    partnerError = "Could not load staff restaurant: ${exception.localizedMessage ?: "try again."}"
+                } else {
+                    val restaurant = snapshot?.takeIf { it.exists() }
+                        ?.toObject(PartnerRestaurant::class.java)
+                        ?.takeIf { it.active }
+                        ?.asRestaurant(restaurantId)
+                    if (restaurant == null) staffRestaurants.remove(restaurantId)
+                    else staffRestaurants[restaurantId] = restaurant
+                    if (selectedRestaurantId !in staffRestaurants.keys) {
+                        selectedRestaurantId = staffRestaurants.keys.firstOrNull()
+                    }
+                }
+            }
+        }
+        onDispose { registrations.forEach { it.remove() } }
+    }
 
     Scaffold(
         containerColor = MaterialTheme.colorScheme.background,
         topBar = {
-            Column(Modifier.fillMaxWidth().padding(horizontal = 20.dp, vertical = 10.dp)) {
-                Row(verticalAlignment = Alignment.CenterVertically) {
-                    BrandMark()
-                    Spacer(Modifier.weight(1f))
-                    Text(
-                        if (email.isNullOrBlank()) "Demo account" else email,
-                        Modifier.weight(1f),
-                        color = Muted,
-                        style = MaterialTheme.typography.labelMedium,
-                        maxLines = 1,
-                        overflow = TextOverflow.Ellipsis,
-                        textAlign = TextAlign.End
-                    )
-                    Spacer(Modifier.size(8.dp))
-                    OutlinedButton(onClick = { auth.signOut() }, contentPadding = ButtonDefaults.ContentPadding) {
-                        Text("Sign out", style = MaterialTheme.typography.labelMedium)
-                    }
-                }
-                Spacer(Modifier.height(12.dp))
-                PrimaryTabRow(selectedTabIndex = selectedTab, containerColor = Color.Transparent) {
-                    listOf("Customer", "Staff").forEachIndexed { index, label ->
-                        Tab(selected = selectedTab == index, onClick = { selectedTab = index }, text = { Text(label) })
-                    }
+            Row(
+                Modifier.fillMaxWidth().padding(horizontal = 20.dp, vertical = 10.dp),
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                BrandMark()
+                Spacer(Modifier.weight(1f))
+                Text(
+                    if (email.isNullOrBlank()) "Demo account" else email,
+                    Modifier.weight(1f),
+                    color = Muted,
+                    style = MaterialTheme.typography.labelMedium,
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis,
+                    textAlign = androidx.compose.ui.text.style.TextAlign.End
+                )
+                Spacer(Modifier.size(8.dp))
+                OutlinedButton(onClick = { auth.signOut() }, contentPadding = ButtonDefaults.ContentPadding) {
+                    Text("Sign out", style = MaterialTheme.typography.labelMedium)
                 }
             }
         }
@@ -213,55 +259,115 @@ private fun QueueHome(email: String?, auth: FirebaseAuth) {
                 .padding(horizontal = 20.dp, vertical = 16.dp),
             verticalArrangement = Arrangement.spacedBy(18.dp)
         ) {
-            Text(if (selectedTab == 0) "Choose a restaurant" else "Restaurant desk", style = MaterialTheme.typography.titleLarge, fontWeight = FontWeight.Bold)
-            Row(
-                modifier = Modifier.fillMaxWidth().horizontalScroll(rememberScrollState()),
-                horizontalArrangement = Arrangement.spacedBy(8.dp)
-            ) {
-                restaurants.forEach { option ->
-                    FilterChip(
-                        selected = restaurantId == option.id,
-                        onClick = { restaurantId = option.id },
-                        label = { Text(option.name) }
-                    )
+            if (!membershipLoaded && membershipError == null) {
+                CircularProgressIndicator(Modifier.align(Alignment.CenterHorizontally))
+            } else if (membershipError != null) {
+                Text(membershipError!!, color = MaterialTheme.colorScheme.error)
+            } else if (membership != null) {
+                Text("Approved staff account", style = MaterialTheme.typography.titleLarge, fontWeight = FontWeight.Bold)
+                Text("Staff tools are limited to restaurants assigned by QLine.", color = Muted)
+                if (staffRestaurants.isEmpty() && partnerError == null) {
+                    Text("No active partner restaurant is assigned to this account.", color = Muted)
+                } else {
+                    val available = staffRestaurants.values.toList()
+                    if (available.size > 1) {
+                        available.forEach { restaurant ->
+                            OutlinedButton(
+                                onClick = { selectedRestaurantId = restaurant.id },
+                                modifier = Modifier.fillMaxWidth()
+                            ) {
+                                Text(
+                                    if (selectedRestaurantId == restaurant.id) "Selected · ${restaurant.name}"
+                                    else restaurant.name
+                                )
+                            }
+                        }
+                    }
+                    val selectedStaffRestaurant = selectedRestaurantId?.let { staffRestaurants[it] }
+                    if (selectedStaffRestaurant != null) StaffPanel(selectedStaffRestaurant)
+                }
+            } else {
+                Text("Explore restaurants", style = MaterialTheme.typography.titleLarge, fontWeight = FontWeight.Bold)
+                partnerError?.let { Text(it, color = MaterialTheme.colorScheme.error) }
+                NearbyRestaurantsMap(partners) { selectedCustomerRestaurant = it }
+                selectedCustomerRestaurant?.let { restaurant ->
+                    RestaurantDetails(restaurant) {
+                        if (restaurant.isPartner) CustomerPanel(restaurant)
+                        QueueReportsPanel(restaurant)
+                    }
                 }
             }
-            if (selectedTab == 0) CustomerPanel(restaurant)
-            else StaffPanel(restaurant)
-            Text("Live updates • Queue data syncs across devices", Modifier.align(Alignment.CenterHorizontally), color = Muted, style = MaterialTheme.typography.labelSmall)
+            partnerError?.let { Text(it, color = MaterialTheme.colorScheme.error) }
+            Text(
+                "Live updates • Official queues are managed by partner staff",
+                Modifier.align(Alignment.CenterHorizontally),
+                color = Muted,
+                style = MaterialTheme.typography.labelSmall
+            )
         }
+    }
+}
+
+@Composable
+private fun RestaurantDetails(restaurant: Restaurant, content: @Composable () -> Unit) {
+    Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
+        Card(colors = CardDefaults.cardColors(containerColor = Color.White), shape = RoundedCornerShape(20.dp)) {
+            Column(Modifier.fillMaxWidth().padding(18.dp), verticalArrangement = Arrangement.spacedBy(5.dp)) {
+                Text(restaurant.name, style = MaterialTheme.typography.titleLarge, fontWeight = FontWeight.Bold)
+                Text(restaurant.cuisine, color = Muted)
+                Text(restaurant.address, color = Muted)
+                Text(
+                    if (restaurant.isPartner) "Official QLine partner" else "Community queue reports only",
+                    color = Teal,
+                    style = MaterialTheme.typography.labelMedium
+                )
+            }
+        }
+        content()
     }
 }
 
 @Composable
 private fun CustomerPanel(restaurant: Restaurant) {
     var queue by remember(restaurant.id) { mutableStateOf<Queue?>(null) }
-    val tickets = remember(restaurant.id) { mutableStateListOf<Ticket>() }
+    var mine by remember(restaurant.id) { mutableStateOf<Ticket?>(null) }
+    var queueError by remember(restaurant.id) { mutableStateOf<String?>(null) }
+    var ticketError by remember(restaurant.id) { mutableStateOf<String?>(null) }
     var status by remember(restaurant.id) { mutableStateOf<String?>(null) }
     var busy by remember(restaurant.id) { mutableStateOf(false) }
     val user = FirebaseAuth.getInstance().currentUser
     val uid = user?.uid ?: return
 
-    DisposableEffect(restaurant.id) {
-        val queueReg = db.collection("queues").document(restaurant.id).addSnapshotListener { snap, _ ->
-            queue = snap?.toObject(Queue::class.java)
-        }
-        val ticketsReg = db.collection("tickets").whereEqualTo("queueId", restaurant.id)
-            .addSnapshotListener { snap, _ ->
-                tickets.clear()
-                snap?.documents?.mapNotNullTo(tickets) { it.toObject(Ticket::class.java) }
+    DisposableEffect(restaurant.id, uid) {
+        val queueReg = db.collection("queues").document(restaurant.id).addSnapshotListener { snap, exception ->
+            if (exception != null) {
+                queueError = "Could not load queue: ${exception.localizedMessage ?: "try again."}"
+            } else {
+                queue = snap?.toObject(Queue::class.java)
+                queueError = null
             }
-        onDispose { queueReg.remove(); ticketsReg.remove() }
+        }
+        val ticketReg = db.collection("tickets").document("${restaurant.id}_$uid")
+            .addSnapshotListener { snap, exception ->
+                if (exception != null) {
+                    ticketError = "Could not load your ticket: ${exception.localizedMessage ?: "try again."}"
+                } else {
+                    mine = snap?.takeIf { it.exists() }?.toObject(Ticket::class.java)
+                        ?.takeIf { it.status in ACTIVE_STATUSES }
+                    ticketError = null
+                }
+            }
+        onDispose { queueReg.remove(); ticketReg.remove() }
     }
-    val mine = tickets.firstOrNull { it.userId == uid && it.status in ACTIVE_STATUSES }
     val current = queue?.currentTicketNumber ?: 0L
-    val ahead = mine?.let { ticket ->
-        tickets.count { it.status == Ticket.WAITING && it.number in (current + 1) until ticket.number }
-    } ?: 0
+    val ahead = mine?.let { queue?.peopleAheadOf(it.number) ?: 0 } ?: 0
     val eta = ahead * (queue?.minutesPerPerson ?: 5)
     val isOpen = queue?.isOpen ?: true
+    val ticket = mine
 
     Column(verticalArrangement = Arrangement.spacedBy(16.dp)) {
+        queueError?.let { Text(it, color = MaterialTheme.colorScheme.error) }
+        ticketError?.let { Text(it, color = MaterialTheme.colorScheme.error) }
         Card(
             colors = CardDefaults.cardColors(containerColor = Ink),
             shape = RoundedCornerShape(24.dp)
@@ -282,15 +388,15 @@ private fun CustomerPanel(restaurant: Restaurant) {
             }
         }
 
-        if (mine != null) {
+        if (ticket != null) {
             Card(colors = CardDefaults.cardColors(containerColor = Mint), shape = RoundedCornerShape(20.dp)) {
                 Row(Modifier.fillMaxWidth().padding(18.dp), verticalAlignment = Alignment.CenterVertically) {
                     Column(Modifier.weight(1f)) {
-                        Text(if (mine.status == Ticket.CALLED || mine.number == current) "It’s your turn" else "You’re in line",
+                        Text(if (ticket.status == Ticket.CALLED || ticket.number == current) "It’s your turn" else "You’re in line",
                             color = Ink, fontWeight = FontWeight.Bold, style = MaterialTheme.typography.titleMedium)
                         Spacer(Modifier.height(4.dp))
                         Text(
-                            if (mine.status == Ticket.CALLED || mine.number == current) "Please make your way to the desk."
+                            if (ticket.status == Ticket.CALLED || ticket.number == current) "Please make your way to the desk."
                             else "$ahead ${if (ahead == 1) "person" else "people"} ahead · about $eta min",
                             color = Ink
                         )
@@ -300,7 +406,7 @@ private fun CustomerPanel(restaurant: Restaurant) {
                             busy = true; status = null
                             cancelTicket(restaurant, uid) { message -> busy = false; status = message }
                         },
-                        enabled = !busy && mine.status == Ticket.WAITING,
+                        enabled = !busy && ticket.status == Ticket.WAITING,
                         colors = ButtonDefaults.buttonColors(containerColor = Color.White, contentColor = Ink)
                     ) { Text(if (busy) "Please wait" else "Cancel") }
                 }
@@ -343,15 +449,27 @@ private fun StaffPanel(restaurant: Restaurant) {
     var queue by remember(restaurant.id) { mutableStateOf<Queue?>(null) }
     val tickets = remember(restaurant.id) { mutableStateListOf<Ticket>() }
     var message by remember(restaurant.id) { mutableStateOf<String?>(null) }
+    var queueError by remember(restaurant.id) { mutableStateOf<String?>(null) }
+    var ticketError by remember(restaurant.id) { mutableStateOf<String?>(null) }
     var busy by remember(restaurant.id) { mutableStateOf(false) }
     DisposableEffect(restaurant.id) {
-        val queueReg = db.collection("queues").document(restaurant.id).addSnapshotListener { snap, _ ->
-            queue = snap?.toObject(Queue::class.java)
+        val queueReg = db.collection("queues").document(restaurant.id).addSnapshotListener { snap, exception ->
+            if (exception != null) {
+                queueError = "Could not load queue: ${exception.localizedMessage ?: "try again."}"
+            } else {
+                queue = snap?.toObject(Queue::class.java)
+                queueError = null
+            }
         }
         val ticketsReg = db.collection("tickets").whereEqualTo("queueId", restaurant.id)
-            .addSnapshotListener { snap, _ ->
-                tickets.clear()
-                snap?.documents?.mapNotNullTo(tickets) { it.toObject(Ticket::class.java) }
+            .addSnapshotListener { snap, exception ->
+                if (exception != null) {
+                    ticketError = "Could not load tickets: ${exception.localizedMessage ?: "try again."}"
+                } else {
+                    tickets.clear()
+                    snap?.documents?.mapNotNullTo(tickets) { it.toObject(Ticket::class.java) }
+                    ticketError = null
+                }
             }
         onDispose { queueReg.remove(); ticketsReg.remove() }
     }
@@ -362,6 +480,8 @@ private fun StaffPanel(restaurant: Restaurant) {
     val isOpen = queue?.isOpen ?: true
 
     Column(verticalArrangement = Arrangement.spacedBy(16.dp)) {
+        queueError?.let { Text(it, color = MaterialTheme.colorScheme.error) }
+        ticketError?.let { Text(it, color = MaterialTheme.colorScheme.error) }
         Card(colors = CardDefaults.cardColors(containerColor = Color.White), shape = RoundedCornerShape(24.dp)) {
             Column(Modifier.fillMaxWidth().padding(22.dp)) {
                 Text(restaurant.name, color = Muted, style = MaterialTheme.typography.labelLarge)
@@ -417,7 +537,7 @@ private fun StaffPanel(restaurant: Restaurant) {
             shape = RoundedCornerShape(16.dp)
         ) { Text("Reset queue") }
         if (message != null) Text(message!!, color = Muted)
-        Text("Staff tools are open for presentation and demo use.", color = Muted, style = MaterialTheme.typography.bodySmall)
+        Text("This account is provisioned for this QLine partner.", color = Muted, style = MaterialTheme.typography.bodySmall)
     }
 }
 
@@ -465,11 +585,20 @@ private fun takeTicket(restaurant: Restaurant, uid: String, callback: (TakeTicke
         if (!queue.isOpen) throw IllegalStateException("This restaurant has paused its queue.")
         val number = queue.nextTicketNumber
         if (queueSnapshot.exists()) {
-            transaction.update(queueRef, "nextTicketNumber", number + 1)
+            transaction.update(
+                queueRef,
+                mapOf(
+                    "nextTicketNumber" to number + 1,
+                    "waitingNumbers" to queue.waitingNumbers + number
+                )
+            )
         } else {
             transaction.set(
                 queueRef,
-                Queue.seed(restaurant.name).copy(nextTicketNumber = number + 1).toMap()
+                Queue.seed(restaurant.name).copy(
+                    nextTicketNumber = number + 1,
+                    waitingNumbers = listOf(number)
+                ).toMap()
             )
         }
         transaction.set(ticketRef, Ticket(restaurant.id, number, uid, Ticket.WAITING).toMap())
@@ -479,11 +608,17 @@ private fun takeTicket(restaurant: Restaurant, uid: String, callback: (TakeTicke
 }
 
 private fun cancelTicket(restaurant: Restaurant, uid: String, callback: (String) -> Unit) {
+    val queueRef = db.collection("queues").document(restaurant.id)
     val ticketRef = db.collection("tickets").document("${restaurant.id}_$uid")
     db.runTransaction { transaction ->
+        val queueSnapshot = transaction.get(queueRef)
         val snapshot = transaction.get(ticketRef)
         val ticket = snapshot.toObject(Ticket::class.java)
-        if (ticket?.status == Ticket.WAITING) transaction.update(ticketRef, "status", Ticket.CANCELLED)
+        if (ticket?.status == Ticket.WAITING) {
+            val queue = queueSnapshot.toObject(Queue::class.java) ?: Queue.seed(restaurant.name)
+            transaction.update(ticketRef, "status", Ticket.CANCELLED)
+            transaction.update(queueRef, "waitingNumbers", queue.waitingNumbers.filterNot { it == ticket.number })
+        }
         null
     }.addOnSuccessListener { callback("Ticket cancelled.") }
         .addOnFailureListener { callback("Could not cancel: ${it.localizedMessage ?: "try again."}") }
@@ -516,11 +651,18 @@ private fun callNext(restaurant: Restaurant, callback: (Boolean, String?) -> Uni
                     queueRef,
                     Queue.seed(restaurant.name).copy(
                         currentTicketNumber = if (nextStillWaiting) next.number else queue.currentTicketNumber,
-                        nextTicketNumber = if (nextStillWaiting) maxOf(queue.nextTicketNumber, next.number + 1) else queue.nextTicketNumber
+                        nextTicketNumber = if (nextStillWaiting) maxOf(queue.nextTicketNumber, next.number + 1) else queue.nextTicketNumber,
+                        waitingNumbers = if (nextStillWaiting) queue.waitingNumbers.filterNot { it == next.number } else queue.waitingNumbers
                     ).toMap()
                 )
             } else if (nextStillWaiting) {
-                transaction.update(queueRef, "currentTicketNumber", next.number)
+                transaction.update(
+                    queueRef,
+                    mapOf(
+                        "currentTicketNumber" to next.number,
+                        "waitingNumbers" to queue.waitingNumbers.filterNot { it == next.number }
+                    )
+                )
             }
             nextStillWaiting
         }.addOnSuccessListener { callback(it, null) }

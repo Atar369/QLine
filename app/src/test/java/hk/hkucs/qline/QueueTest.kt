@@ -19,4 +19,21 @@ class QueueTest {
 
         assertEquals(false, queue.toMap()["isOpen"])
     }
+
+    @Test
+    fun waitingNumbersArePersistedForCustomerPositionUpdates() {
+        val queue = Queue.seed("Harbour Grill").copy(waitingNumbers = listOf(1L, 2L))
+
+        assertEquals(listOf(1L, 2L), queue.toMap()["waitingNumbers"])
+    }
+
+    @Test
+    fun peopleAheadCountsOnlyWaitingNumbersAfterCurrentTicket() {
+        val queue = Queue.seed("Harbour Grill").copy(
+            currentTicketNumber = 2,
+            waitingNumbers = listOf(1, 3, 5, 6)
+        )
+
+        assertEquals(2, queue.peopleAheadOf(6))
+    }
 }
