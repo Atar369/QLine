@@ -1,17 +1,17 @@
+import java.util.Properties
+
 plugins {
     alias(libs.plugins.android.application)
     alias(libs.plugins.kotlin.compose)
-    id("com.google.gms.google-services")
+    alias(libs.plugins.google.services)
 }
 
-import java.util.Properties
-
-val localProperties = Properties().apply {
+val localProperties: Properties = Properties().apply {
     val file = rootProject.file("local.properties")
     if (file.exists()) file.inputStream().use { load(it) }
 }
 
-val mapsApiKey = localProperties.getProperty("MAPS_API_KEY", "")
+val mapsApiKey: String = localProperties.getProperty("MAPS_API_KEY", "")
 
 android {
     namespace = "hk.hkucs.qline"
@@ -53,15 +53,14 @@ kotlin {
 }
 
 dependencies {
-    implementation(platform("com.google.firebase:firebase-bom:35.2.0"))
-
-    implementation("com.google.firebase:firebase-analytics")
-    implementation("com.google.firebase:firebase-auth")
-    implementation("com.google.firebase:firebase-firestore")
-    implementation("com.google.firebase:firebase-storage")
-    implementation("com.google.android.libraries.places:places:6.1.0")
-    implementation("com.google.android.gms:play-services-location:21.4.0")
-    implementation("com.google.maps.android:maps-compose:9.0.1")
+    implementation(platform(libs.firebase.bom))
+    implementation(libs.firebase.analytics)
+    implementation(libs.firebase.auth)
+    implementation(libs.firebase.firestore)
+    implementation(libs.firebase.storage)
+    implementation(libs.places)
+    implementation(libs.play.services.location)
+    implementation(libs.maps.compose)
 
     implementation(platform(libs.androidx.compose.bom))
     implementation(libs.androidx.activity.compose)
