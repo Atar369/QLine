@@ -1,13 +1,11 @@
 package hk.hkucs.qline
 
-import android.graphics.Bitmap
-import android.graphics.BitmapFactory
-import android.graphics.ImageDecoder
-import android.os.Build
+import android.Manifest
+import android.content.pm.PackageManager
+import android.location.Location
 import android.text.format.DateUtils
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
-import androidx.compose.foundation.Image
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
@@ -27,44 +25,181 @@ import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
-import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateListOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Modifier
-import androidx.compose.ui.graphics.asImageBitmap
-import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.unit.dp
+import androidx.core.content.ContextCompat
+import com.google.android.gms.location.LocationServices
+import com.google.android.gms.location.Priority
+import com.google.android.gms.tasks.CancellationTokenSource
+import com.google.firebase.Timestamp
 import com.google.firebase.auth.FirebaseAuth
 import com.google.firebase.firestore.FieldValue
 import com.google.firebase.firestore.FirebaseFirestore
 import com.google.firebase.firestore.Query
-import com.google.firebase.storage.FirebaseStorage
-import com.google.firebase.storage.StorageMetadata
-import java.nio.ByteBuffer
-import java.io.IOException
 import java.util.UUID
 
-private const val MAX_REPORT_IMAGE_BYTES = 5L * 1024L * 1024L
-private const val MAX_REPORT_IMAGE_DIMENSION = 1200
+private const val MAX_REPORT_ESTIMATE = 10_000L
+private const val MAX_LOCATION_AGE_MILLIS = 2 * 60 * 1000L
+
+private class QueueReportCooldownException(val minutesRemaining: Long) : Exception()
 
 @Composable
 fun QueueReportsPanel(restaurant: Restaurant) {
     val context = LocalContext.current
     val reports = remember(restaurant.id) { mutableStateListOf<QueueReport>() }
     var reportLoadError by remember(restaurant.id) { mutableStateOf<String?>(null) }
-    var selectedImage by remember(restaurant.id) { mutableStateOf<android.net.Uri?>(null) }
     var peopleEstimate by remember(restaurant.id) { mutableStateOf("") }
     var waitEstimate by remember(restaurant.id) { mutableStateOf("") }
     var uploadBusy by remember(restaurant.id) { mutableStateOf(false) }
     var message by remember(restaurant.id) { mutableStateOf<String?>(null) }
-    val picker = rememberLauncherForActivityResult(ActivityResultContracts.GetContent()) { uri ->
-        selectedImage = uri
-        message = null
+    val locationClient = remember(context) {
+        LocationServices.getFusedLocationProviderClient(context)
+    }
+
+    fun shareReport(uid: String) {
+        val reportId = UUID.randomUUID().toString()
+        val firestore = FirebaseFirestore.getInstance()
+        val reportRef = firestore.collection("queueReports").document(reportId)
+        val rateLimitRef = firestore.collection("queueReportRateLimits")
+            .document(uid)
+            .collection("restaurants")
+            .document(restaurant.id)
+        val report = QueueReport(
+            restaurantId = restaurant.id,
+            userId = uid,
+            estimatedPeople = peopleEstimate.toLongOrNull(),
+            waitMinutes = waitEstimate.toLongOrNull()
+        )
+
+        firestore.runTransaction { transaction ->
+            val rateLimit = transaction.get(rateLimitRef)
+            val lastReportedAt = rateLimit.getTimestamp("lastReportedAt")
+            if (lastReportedAt != null) {
+                val remainingMillis =
+                    QUEUE_REPORT_COOLDOWN_MILLIS -
+                        (System.currentTimeMillis() - lastReportedAt.toDate().time)
+                if (remainingMillis > 0) {
+                    throw QueueReportCooldownException(
+                        (remainingMillis + 59_999L) / 60_000L
+                    )
+                }
+            }
+
+            transaction.set(
+                reportRef,
+                report.toMap() + ("createdAt" to FieldValue.serverTimestamp())
+            )
+            transaction.set(
+                rateLimitRef,
+                mapOf(
+                    "reportId" to reportId,
+                    "lastReportedAt" to FieldValue.serverTimestamp()
+                )
+            )
+            true
+        }.addOnSuccessListener {
+            uploadBusy = false
+            peopleEstimate = ""
+            waitEstimate = ""
+            message = "Queue report shared."
+        }.addOnFailureListener { exception ->
+            uploadBusy = false
+            message = if (exception is QueueReportCooldownException) {
+                "You can report this restaurant again in about ${exception.minutesRemaining} minutes."
+            } else {
+                "Could not save your report: ${exception.localizedMessage ?: "try again."}"
+            }
+        }
+    }
+
+    fun verifyLocationAndShare() {
+        val hasFineLocation = ContextCompat.checkSelfPermission(
+            context,
+            Manifest.permission.ACCESS_FINE_LOCATION
+        ) == PackageManager.PERMISSION_GRANTED
+        val hasCoarseLocation = ContextCompat.checkSelfPermission(
+            context,
+            Manifest.permission.ACCESS_COARSE_LOCATION
+        ) == PackageManager.PERMISSION_GRANTED
+        if (!hasFineLocation && !hasCoarseLocation) {
+            uploadBusy = false
+            message = "Allow location access to share a report."
+            return
+        }
+
+        try {
+            locationClient.getCurrentLocation(
+                Priority.PRIORITY_HIGH_ACCURACY,
+                CancellationTokenSource().token
+            ).addOnSuccessListener { location ->
+                if (location == null) {
+                    uploadBusy = false
+                    message = "Could not verify your location. Turn on device location and try again."
+                    return@addOnSuccessListener
+                }
+
+                val locationAgeMillis = System.currentTimeMillis() - location.time
+                if (locationAgeMillis !in 0L..MAX_LOCATION_AGE_MILLIS) {
+                    uploadBusy = false
+                    message = "Your location is out of date. Try sharing again."
+                    return@addOnSuccessListener
+                }
+                if (!location.hasAccuracy() ||
+                    !location.accuracy.isFinite() ||
+                    location.accuracy > MAX_QUEUE_REPORT_LOCATION_ACCURACY_METERS
+                ) {
+                    uploadBusy = false
+                    message = "Turn on precise location to verify you are near the restaurant."
+                    return@addOnSuccessListener
+                }
+
+                val distance = FloatArray(1)
+                Location.distanceBetween(
+                    location.latitude,
+                    location.longitude,
+                    restaurant.latitude,
+                    restaurant.longitude,
+                    distance
+                )
+                if (!isWithinQueueReportRadius(distance[0].toDouble(), location.accuracy)) {
+                    uploadBusy = false
+                    message = "You must be within 250 m of the restaurant to share a report."
+                    return@addOnSuccessListener
+                }
+
+                val uid = FirebaseAuth.getInstance().currentUser?.uid
+                if (uid == null) {
+                    uploadBusy = false
+                    message = "Sign in before sharing a queue report."
+                } else {
+                    shareReport(uid)
+                }
+            }.addOnFailureListener { exception ->
+                uploadBusy = false
+                message = "Could not verify your location: ${exception.localizedMessage ?: "try again."}"
+            }
+        } catch (_: SecurityException) {
+            uploadBusy = false
+            message = "Location permission is needed to share a report."
+        }
+    }
+
+    val locationPermissionLauncher = rememberLauncherForActivityResult(
+        ActivityResultContracts.RequestMultiplePermissions()
+    ) { permissions ->
+        if (permissions.values.any { it }) {
+            verifyLocationAndShare()
+        } else {
+            uploadBusy = false
+            message = "Allow location access to share a report."
+        }
     }
 
     DisposableEffect(restaurant.id) {
@@ -90,22 +225,16 @@ fun QueueReportsPanel(restaurant: Restaurant) {
         Text("Community queue reports", style = MaterialTheme.typography.titleMedium)
         Text(
             if (restaurant.isPartner) {
-                "The live queue is managed by this partner. Share a photo to give other guests extra context."
+                "The live queue is managed by this partner. Share an on-site estimate for extra context."
             } else {
-                "This restaurant is not a QLine partner. Reports are customer-submitted estimates, not an official queue."
+                "Reports are customer-submitted estimates, not an official queue. You must be near the restaurant to report."
             },
             color = MaterialTheme.colorScheme.onSurfaceVariant
         )
-        Button(onClick = { picker.launch("image/*") }, enabled = !uploadBusy) {
-            Text(if (selectedImage == null) "Choose queue photo" else "Choose a different photo")
-        }
-        selectedImage?.let {
-            Text("Photo selected", color = MaterialTheme.colorScheme.primary)
-        }
         Row(horizontalArrangement = Arrangement.spacedBy(10.dp)) {
             OutlinedTextField(
                 value = peopleEstimate,
-                onValueChange = { peopleEstimate = it.filter(Char::isDigit).take(4) },
+                onValueChange = { peopleEstimate = it.filter(Char::isDigit).take(5) },
                 modifier = Modifier.weight(1f),
                 label = { Text("People in line") },
                 singleLine = true,
@@ -113,7 +242,7 @@ fun QueueReportsPanel(restaurant: Restaurant) {
             )
             OutlinedTextField(
                 value = waitEstimate,
-                onValueChange = { waitEstimate = it.filter(Char::isDigit).take(4) },
+                onValueChange = { waitEstimate = it.filter(Char::isDigit).take(5) },
                 modifier = Modifier.weight(1f),
                 label = { Text("Wait (minutes)") },
                 singleLine = true,
@@ -123,60 +252,35 @@ fun QueueReportsPanel(restaurant: Restaurant) {
         Button(
             onClick = {
                 val uid = FirebaseAuth.getInstance().currentUser?.uid
-                val imageUri = selectedImage
-                val mimeType = imageUri?.let(context.contentResolver::getType)
-                val supportedImageType = mimeType in setOf("image/jpeg", "image/png", "image/webp") ||
-                    (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P && mimeType in setOf("image/heic", "image/heif"))
-                if (uid == null) {
-                    message = "Sign in before sharing a queue report."
-                } else if (imageUri == null) {
-                    message = "Choose a queue photo first."
-                } else if (!supportedImageType) {
-                    message = "Choose a JPEG, PNG, or WebP image (HEIC is supported on Android 9 and newer)."
-                } else if ((peopleEstimate.toLongOrNull() ?: 0L) > 10000L ||
-                    (waitEstimate.toLongOrNull() ?: 0L) > 10000L
-                ) {
-                    message = "Estimates must be 10,000 or less."
-                } else {
-                    uploadBusy = true
-                    message = null
-                    val reportId = UUID.randomUUID().toString()
-                    val storagePath = "queue-reports/${restaurant.id}/$uid/$reportId"
-                    val storageRef = FirebaseStorage.getInstance().reference.child(storagePath)
-                    val metadata = StorageMetadata.Builder().setContentType(mimeType).build()
-                    storageRef.putFile(imageUri, metadata)
-                        .addOnSuccessListener {
-                            val report = QueueReport(
-                                restaurantId = restaurant.id,
-                                userId = uid,
-                                storagePath = storagePath,
-                                estimatedPeople = peopleEstimate.toLongOrNull(),
-                                waitMinutes = waitEstimate.toLongOrNull()
+                when {
+                    uid == null -> message = "Sign in before sharing a queue report."
+                    peopleEstimate.isBlank() && waitEstimate.isBlank() ->
+                        message = "Enter the people in line, the wait estimate, or both."
+                    (peopleEstimate.toLongOrNull() ?: 0L) > MAX_REPORT_ESTIMATE ||
+                        (waitEstimate.toLongOrNull() ?: 0L) > MAX_REPORT_ESTIMATE ->
+                        message = "Estimates must be 10,000 or less."
+                    else -> {
+                        uploadBusy = true
+                        message = null
+                        val hasFineLocation = ContextCompat.checkSelfPermission(
+                            context,
+                            Manifest.permission.ACCESS_FINE_LOCATION
+                        ) == PackageManager.PERMISSION_GRANTED
+                        val hasCoarseLocation = ContextCompat.checkSelfPermission(
+                            context,
+                            Manifest.permission.ACCESS_COARSE_LOCATION
+                        ) == PackageManager.PERMISSION_GRANTED
+                        if (hasFineLocation || hasCoarseLocation) {
+                            verifyLocationAndShare()
+                        } else {
+                            locationPermissionLauncher.launch(
+                                arrayOf(
+                                    Manifest.permission.ACCESS_FINE_LOCATION,
+                                    Manifest.permission.ACCESS_COARSE_LOCATION
+                                )
                             )
-                            FirebaseFirestore.getInstance().collection("queueReports")
-                                .document(reportId)
-                                .set(report.toMap() + ("createdAt" to FieldValue.serverTimestamp()))
-                                .addOnSuccessListener {
-                                    uploadBusy = false
-                                    selectedImage = null
-                                    peopleEstimate = ""
-                                    waitEstimate = ""
-                                    message = "Queue report shared."
-                                }
-                                .addOnFailureListener { exception ->
-                                    storageRef.delete().addOnCompleteListener { cleanup ->
-                                        uploadBusy = false
-                                        val cleanupNotice = if (cleanup.isSuccessful) "" else
-                                            " The uploaded photo could not be removed."
-                                        message =
-                                            "Could not save your report: ${exception.localizedMessage ?: "try again."}$cleanupNotice"
-                                    }
-                                }
                         }
-                        .addOnFailureListener { exception ->
-                            uploadBusy = false
-                            message = "Could not upload the photo: ${exception.localizedMessage ?: "check Firebase Storage setup."}"
-                        }
+                    }
                 }
             },
             enabled = !uploadBusy,
@@ -185,6 +289,11 @@ fun QueueReportsPanel(restaurant: Restaurant) {
             if (uploadBusy) CircularProgressIndicator(Modifier.size(18.dp), strokeWidth = 2.dp)
             else Text("Share queue report")
         }
+        Text(
+            "Text-only reports require location within 250 m. One report per restaurant every 15 minutes.",
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+            style = MaterialTheme.typography.bodySmall
+        )
         message?.let { Text(it, color = MaterialTheme.colorScheme.onSurfaceVariant) }
         reportLoadError?.let { Text(it, color = MaterialTheme.colorScheme.error) }
         if (reports.isEmpty() && reportLoadError == null) {
@@ -198,21 +307,6 @@ fun QueueReportsPanel(restaurant: Restaurant) {
 
 @Composable
 private fun QueueReportCard(report: QueueReport) {
-    var bitmap by remember(report.storagePath) { mutableStateOf<Bitmap?>(null) }
-    var imageError by remember(report.storagePath) { mutableStateOf<String?>(null) }
-
-    LaunchedEffect(report.storagePath) {
-        FirebaseStorage.getInstance().reference.child(report.storagePath)
-            .getBytes(MAX_REPORT_IMAGE_BYTES)
-            .addOnSuccessListener { bytes ->
-                bitmap = decodeReportImage(bytes)
-                if (bitmap == null) imageError = "Could not display this photo."
-            }
-            .addOnFailureListener { exception ->
-                imageError = "Could not load this photo: ${exception.localizedMessage ?: "try again."}"
-            }
-    }
-
     Card(
         colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surface),
         shape = RoundedCornerShape(18.dp)
@@ -221,18 +315,6 @@ private fun QueueReportCard(report: QueueReport) {
             Modifier.fillMaxWidth().padding(14.dp),
             verticalArrangement = Arrangement.spacedBy(8.dp)
         ) {
-            bitmap?.let {
-                Image(
-                    bitmap = it.asImageBitmap(),
-                    contentDescription = "Customer-submitted queue photo",
-                    modifier = Modifier.fillMaxWidth().height(190.dp),
-                    contentScale = ContentScale.Crop
-                )
-            } ?: if (imageError != null) {
-                Text(imageError!!, color = MaterialTheme.colorScheme.error)
-            } else {
-                CircularProgressIndicator(Modifier.size(20.dp), strokeWidth = 2.dp)
-            }
             val estimates = listOfNotNull(
                 report.estimatedPeople?.let { "$it people" },
                 report.waitMinutes?.let { "$it min estimated wait" }
@@ -255,33 +337,5 @@ private fun QueueReportCard(report: QueueReport) {
                 )
             } ?: Text("Just reported", style = MaterialTheme.typography.bodySmall)
         }
-    }
-}
-
-private fun decodeReportImage(bytes: ByteArray): Bitmap? {
-    return try {
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
-            val source = ImageDecoder.createSource(ByteBuffer.wrap(bytes))
-            ImageDecoder.decodeBitmap(source) { decoder, info, _ ->
-                val largestDimension = maxOf(info.size.width, info.size.height)
-                val scale = minOf(1f, MAX_REPORT_IMAGE_DIMENSION.toFloat() / largestDimension)
-                decoder.setTargetSize(
-                    (info.size.width * scale).toInt(),
-                    (info.size.height * scale).toInt()
-                )
-            }
-        } else {
-            val bounds = BitmapFactory.Options().apply { inJustDecodeBounds = true }
-            BitmapFactory.decodeByteArray(bytes, 0, bytes.size, bounds)
-            val largestDimension = maxOf(bounds.outWidth, bounds.outHeight)
-            var sampleSize = 1
-            while (largestDimension / sampleSize > MAX_REPORT_IMAGE_DIMENSION) sampleSize *= 2
-            val options = BitmapFactory.Options().apply { inSampleSize = sampleSize }
-            BitmapFactory.decodeByteArray(bytes, 0, bytes.size, options)
-        }
-    } catch (_: IOException) {
-        null
-    } catch (_: IllegalArgumentException) {
-        null
     }
 }

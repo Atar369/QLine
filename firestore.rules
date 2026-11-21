@@ -137,17 +137,18 @@ service cloud.firestore {
       allow delete: if false;
     }
 
-    match /queueReports/{reportId} {
-      allow read: if signedIn();
-      allow create: if signedIn()
+    function validQueueReport(reportId) {
+      let restaurantId = request.resource.data.restaurantId;
+      let rateLimitPath = /databases/$(database)/documents/queueReportRateLimits/$(request.auth.uid)/restaurants/$(restaurantId);
+      return signedIn()
         && request.resource.data.keys().hasOnly([
-          'restaurantId', 'userId', 'storagePath', 'estimatedPeople', 'waitMinutes', 'createdAt'
+          'restaurantId', 'userId', 'estimatedPeople', 'waitMinutes', 'createdAt'
         ])
         && request.resource.data.userId == request.auth.uid
-        && request.resource.data.restaurantId is string
-        && request.resource.data.storagePath
-          == 'queue-reports/' + request.resource.data.restaurantId + '/' + request.auth.uid + '/' + reportId
+        && restaurantId is string
         && request.resource.data.createdAt == request.time
+        && (request.resource.data.estimatedPeople is int
+          || request.resource.data.waitMinutes is int)
         && (request.resource.data.estimatedPeople == null
           || (request.resource.data.estimatedPeople is int
             && request.resource.data.estimatedPeople >= 0
@@ -155,8 +156,37 @@ service cloud.firestore {
         && (request.resource.data.waitMinutes == null
           || (request.resource.data.waitMinutes is int
             && request.resource.data.waitMinutes >= 0
-            && request.resource.data.waitMinutes <= 10000));
+            && request.resource.data.waitMinutes <= 10000))
+        && existsAfter(rateLimitPath)
+        && getAfter(rateLimitPath).data.reportId == reportId
+        && getAfter(rateLimitPath).data.lastReportedAt == request.time;
+    }
+
+    match /queueReports/{reportId} {
+      allow read: if signedIn();
+      allow create: if validQueueReport(reportId);
       allow update, delete: if false;
+    }
+
+    match /queueReportRateLimits/{userId}/restaurants/{restaurantId} {
+      function validRateLimitWrite() {
+        let reportPath = /databases/$(database)/documents/queueReports/$(request.resource.data.reportId);
+        return signedIn()
+          && request.auth.uid == userId
+          && request.resource.data.keys().hasOnly(['reportId', 'lastReportedAt'])
+          && request.resource.data.reportId is string
+          && request.resource.data.lastReportedAt == request.time
+          && existsAfter(reportPath)
+          && getAfter(reportPath).data.userId == userId
+          && getAfter(reportPath).data.restaurantId == restaurantId
+          && getAfter(reportPath).data.createdAt == request.time;
+      }
+
+      allow read: if signedIn() && request.auth.uid == userId;
+      allow create: if validRateLimitWrite();
+      allow update: if validRateLimitWrite()
+        && request.time >= resource.data.lastReportedAt + duration.value(15, 'm');
+      allow delete: if false;
     }
   }
 }
