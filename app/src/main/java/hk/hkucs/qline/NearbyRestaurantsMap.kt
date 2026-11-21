@@ -1,7 +1,13 @@
 package hk.hkucs.qline
 
 import android.Manifest
+import android.app.Activity
+import android.content.Intent
+import android.location.Location
+import android.location.LocationManager
 import android.content.pm.PackageManager
+import android.net.Uri
+import android.provider.Settings
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.layout.Arrangement
@@ -20,6 +26,7 @@ import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.Text
+import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
@@ -91,8 +98,22 @@ fun NearbyRestaurantsMap(
     var error by remember { mutableStateOf<String?>(null) }
     var generation by remember { mutableIntStateOf(0) }
     var locationMessage by remember { mutableStateOf<String?>(null) }
+    var locationSettingsNeeded by remember { mutableStateOf(false) }
+    var appSettingsNeeded by remember { mutableStateOf(false) }
 
     val locationClient = remember(context) { LocationServices.getFusedLocationProviderClient(context) }
+    fun updateCameraFromLocation(location: Location?) {
+        if (location == null) {
+            locationMessage = "Could not get your location. Move the map to search another area."
+        } else {
+            locationSettingsNeeded = false
+            appSettingsNeeded = false
+            cameraPositionState.position = CameraPosition.fromLatLngZoom(
+                LatLng(location.latitude, location.longitude),
+                14f
+            )
+        }
+    }
     fun centerOnCurrentLocation() {
         val hasFineLocation = ContextCompat.checkSelfPermission(
             context,
@@ -106,19 +127,27 @@ fun NearbyRestaurantsMap(
             locationMessage = "Location permission is needed to center the map; you can also move the map manually."
             return
         }
+        val locationManager = context.getSystemService(LocationManager::class.java)
+        val locationEnabled = locationManager?.isLocationEnabled == true
+        if (!locationEnabled) {
+            locationMessage = "Device location is turned off. Turn it on or move the map manually."
+            locationSettingsNeeded = true
+            appSettingsNeeded = false
+            return
+        }
+        locationSettingsNeeded = false
+        appSettingsNeeded = false
         locationMessage = null
         locationClient.getCurrentLocation(
             Priority.PRIORITY_BALANCED_POWER_ACCURACY,
             CancellationTokenSource().token
         ).addOnSuccessListener { location ->
-            if (location == null) {
-                locationMessage = "Could not get your location. Move the map to search another area."
-            } else {
-                cameraPositionState.position = CameraPosition.fromLatLngZoom(
-                    LatLng(location.latitude, location.longitude),
-                    14f
-                )
-            }
+            if (location != null) updateCameraFromLocation(location)
+            else locationClient.lastLocation
+                .addOnSuccessListener(::updateCameraFromLocation)
+                .addOnFailureListener {
+                    updateCameraFromLocation(null)
+                }
         }.addOnFailureListener {
             locationMessage = "Could not get your location: ${it.localizedMessage ?: "try moving the map manually."}"
         }
@@ -126,8 +155,22 @@ fun NearbyRestaurantsMap(
     val locationPermissionLauncher = rememberLauncherForActivityResult(
         ActivityResultContracts.RequestMultiplePermissions()
     ) { permissions ->
-        if (permissions.values.any { it }) centerOnCurrentLocation()
-        else locationMessage = "Location permission was denied. Move the map manually to search."
+        if (permissions.values.any { it }) {
+            centerOnCurrentLocation()
+        } else {
+            val activity = context as? Activity
+            val permanentlyDenied = activity?.let {
+                !it.shouldShowRequestPermissionRationale(Manifest.permission.ACCESS_FINE_LOCATION) &&
+                    !it.shouldShowRequestPermissionRationale(Manifest.permission.ACCESS_COARSE_LOCATION)
+            } == true
+            appSettingsNeeded = permanentlyDenied
+            locationSettingsNeeded = false
+            locationMessage = if (permanentlyDenied) {
+                "Location permission was denied. Enable it in App settings or move the map manually."
+            } else {
+                "Location permission was denied. Move the map manually to search."
+            }
+        }
     }
 
     LaunchedEffect(cameraPositionState, placesClient, availablePartners) {
@@ -267,6 +310,25 @@ fun NearbyRestaurantsMap(
                 Text("${restaurants.size} found", style = MaterialTheme.typography.labelMedium)
             }
             locationMessage?.let { Text(it, color = MaterialTheme.colorScheme.error) }
+            if (locationSettingsNeeded) {
+                TextButton(
+                    onClick = {
+                        context.startActivity(Intent(Settings.ACTION_LOCATION_SOURCE_SETTINGS))
+                    }
+                ) { Text("Open location settings") }
+            }
+            if (appSettingsNeeded) {
+                TextButton(
+                    onClick = {
+                        context.startActivity(
+                            Intent(
+                                Settings.ACTION_APPLICATION_DETAILS_SETTINGS,
+                                Uri.parse("package:${context.packageName}")
+                            )
+                        )
+                    }
+                ) { Text("Open app settings") }
+            }
             error?.let { Text(it, color = MaterialTheme.colorScheme.error) }
             if (!loading && restaurants.isEmpty() && error == null) {
                 Text(
